@@ -24,7 +24,7 @@ OpenWave is an open-source, reverse-engineered alternative to Elgato Wave Link f
 - **Microphone controls** — Adjust gain and mute, with 48 V phantom power on supported XLR devices.
 - **Headphone controls** — Set volume, enable low impedance mode on supported devices, or adjust the monitor mix on Wave XLR (`007d`), Wave:3 and XLR Dock MK.2.
 - **Hardware and system sync** — Polling at 10 Hz tracks physical buttons and knobs. Hardware mute and headphone volume synchronize with PipeWire/ALSA.
-- **Hotplug and capture readiness** — Adding or removing a device preserves other connected units. The daemon maintains a keepalive per Wave input; the mixer requires raw capture readiness before Wave playback.
+- **Hotplug and capture readiness** — Adding or removing a device preserves other connected units. Gain, headphone volume, low impedance mode and monitor mix are remembered per unit and reasserted when it reconnects or the app starts, since the firmware forgets them on power loss. The daemon maintains a keepalive per Wave input; the mixer requires raw capture readiness before Wave playback.
 - **Dynamic mixing** — Add application or hardware sources, independent mixes, per-send levels and outputs, with published capture inputs for OBS and voice applications.
 - **Scenes and remote controls** — Recall matrix levels and serial-bound hardware settings, or control the running app through typed session-bus actions. Scenes never include phantom power.
 - **Capture DSP** — Low cut, gate, compression, EQ, delay and optional mono, with cancellable raw-input calibration and explicit proposal acceptance.
