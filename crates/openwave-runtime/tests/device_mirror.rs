@@ -14,6 +14,20 @@ mod process {
         pub values: HashMap<u32, String>,
         pub replace_after_contents: Option<PathBuf>,
     }
+    /// Change watching is never started in these fixtures.
+    pub struct OwnedChild;
+    #[allow(dead_code)]
+    impl OwnedChild {
+        pub fn spawn(_: &str, _: &[String], _: std::process::Stdio) -> Result<Self> {
+            panic!("no native commands in ALSA fixtures")
+        }
+        pub fn take_stdout(&mut self) -> Option<std::process::ChildStdout> {
+            None
+        }
+        pub fn terminate(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
     #[derive(Clone, Default)]
     pub struct CommandRunner(pub Arc<Mutex<Amixer>>);
     pub struct Output {
@@ -197,6 +211,8 @@ mod device {
             vendor,
             alsa: Some(Box::new(alsa)),
             mirror: Mirror::default(),
+            reporting_card: None,
+            watch: None,
         };
         let state = backend
             .apply(&[
@@ -276,6 +292,8 @@ mod device {
             vendor,
             alsa: Some(Box::new(alsa)),
             mirror: Mirror::default(),
+            reporting_card: None,
+            watch: None,
         };
         backend.poll().unwrap();
         fixture_lock(&shared).fail[Field::Mute.index()] = true;
@@ -441,6 +459,8 @@ mod device {
             vendor,
             alsa: Some(Box::new(controls)),
             mirror,
+            reporting_card: None,
+            watch: None,
         };
         let (observed, errors) = device.poll().unwrap();
         assert!(errors.is_empty());

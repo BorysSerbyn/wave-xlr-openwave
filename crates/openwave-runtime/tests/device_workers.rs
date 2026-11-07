@@ -24,6 +24,10 @@ mod device {
         opens: AtomicUsize,
         /// `None` behaves like stock firmware, which refuses the log request.
         firmware_log: Mutex<Option<Vec<u8>>>,
+        /// Behaves like firmware that reports its own changes.
+        reporting: AtomicBool,
+        poke: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+        polls: AtomicUsize,
     }
     struct ReleaseGate(Arc<Fixture>);
     impl Drop for ReleaseGate {
@@ -72,6 +76,7 @@ mod device {
             })
         }
         fn poll(&mut self) -> Result<(DeviceState, Vec<OperationIssue>)> {
+            self.fixture.polls.fetch_add(1, Ordering::SeqCst);
             if self.fixture.fail_polls.load(Ordering::SeqCst) {
                 self.fixture.failed_polls.fetch_add(1, Ordering::SeqCst);
                 Err(OperationError::unavailable("fixture transfer timeout"))
@@ -102,6 +107,18 @@ mod device {
         }
         fn unresponsive(&self) -> bool {
             self.fixture.fail_polls.load(Ordering::SeqCst)
+        }
+        fn poll_interval(&self) -> Duration {
+            if self.fixture.reporting.load(Ordering::SeqCst) {
+                REPORTED_POLL
+            } else {
+                POLL
+            }
+        }
+        fn watch_changes(&mut self, poke: Arc<dyn Fn() + Send + Sync>) {
+            if self.fixture.reporting.load(Ordering::SeqCst) {
+                *fixture_lock(&self.fixture.poke) = Some(poke);
+            }
         }
         fn firmware_log(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
             Ok(fixture_lock(&self.fixture.firmware_log)
@@ -143,6 +160,9 @@ mod device {
                 failed_polls: AtomicUsize::new(0),
                 opens: AtomicUsize::new(0),
                 firmware_log: Mutex::new(None),
+                reporting: AtomicBool::new(false),
+                poke: Mutex::new(None),
+                polls: AtomicUsize::new(0),
             }),
             written,
             dropped,
@@ -177,6 +197,107 @@ mod device {
             }
         }
         None
+    }
+
+    #[test]
+    fn reported_changes_wake_a_slowly_polled_unit_at_once() {
+        let (fixture, _, _, _) = fixture(&[1], 0);
+        fixture.reporting.store(true, Ordering::SeqCst);
+        let (_manager, events) =
+            DeviceManager::start_with(Arc::new(Factory(fixture.clone()))).unwrap();
+        let unit = connected(&events);
+        let poke = fixture_lock(&fixture.poke)
+            .clone()
+            .expect("owner starts watching a reporting unit");
+        let before = fixture.polls.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            fixture.polls.load(Ordering::SeqCst),
+            before,
+            "a reporting unit is not polled every 100 ms"
+        );
+        let poked = Instant::now();
+        poke();
+        loop {
+            match event(&events) {
+                DeviceEvent::Observed(snapshot) => {
+                    assert_eq!(snapshot.id, unit);
+                    break;
+                }
+                DeviceEvent::Error { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(
+            poked.elapsed() < REPORTED_POLL - Duration::from_millis(100),
+            "the report, not the interval, caused the poll"
+        );
+    }
+
+    #[test]
+    fn reports_cannot_starve_queued_writes() {
+        let (fixture, written, _, _) = fixture(&[1], 0);
+        fixture.reporting.store(true, Ordering::SeqCst);
+        let (manager, events) =
+            DeviceManager::start_with(Arc::new(Factory(fixture.clone()))).unwrap();
+        let unit = connected(&events);
+        let poke = fixture_lock(&fixture.poke).clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let storm = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    poke();
+                }
+            })
+        };
+        let start = Instant::now();
+        manager
+            .submit(unit, 7, vec![DeviceSetting::Mute(true)])
+            .unwrap();
+        let (to, settings) = written
+            .recv_timeout(Duration::from_secs(5))
+            .expect("write ran despite constant reports");
+        stop.store(true, Ordering::SeqCst);
+        storm.join().unwrap();
+        assert_eq!((to, settings), (unit, vec![DeviceSetting::Mute(true)]));
+        let polls = fixture.polls.load(Ordering::SeqCst);
+        let bound = start.elapsed().as_millis() / POKE_SPACING.as_millis() + 3;
+        assert!(
+            (polls as u128) <= bound,
+            "reported changes are polled at most every POKE_SPACING ({polls} > {bound})"
+        );
+    }
+
+    #[test]
+    fn change_watch_pokes_for_value_lines_and_ends_when_the_monitor_does() {
+        let output = "node hw:3, #6 (2,0,0,Mic Capture Volume,0) VALUE\n\
+                      node hw:3, #6 (2,0,0,Mic Capture Volume,0) INFO\n\
+                      node hw:3, #2 (2,0,0,Headphone Playback Volume,0) VALUE\n";
+        let pokes = AtomicUsize::new(0);
+        let alive = AtomicBool::new(true);
+        watch_lines(
+            std::io::Cursor::new(output),
+            &|| {
+                pokes.fetch_add(1, Ordering::SeqCst);
+            },
+            &alive,
+        );
+        // Two value changes, plus one poke when the output ends.
+        assert_eq!(pokes.load(Ordering::SeqCst), 3);
+        assert!(!alive.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn stock_units_keep_the_fast_poll_and_are_not_watched() {
+        let (fixture, _, _, _) = fixture(&[1], 0);
+        let (_manager, events) =
+            DeviceManager::start_with(Arc::new(Factory(fixture.clone()))).unwrap();
+        connected(&events);
+        let before = fixture.polls.load(Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(450));
+        assert!(fixture.polls.load(Ordering::SeqCst) >= before + 3);
+        assert!(fixture_lock(&fixture.poke).is_none());
     }
 
     #[test]

@@ -16,7 +16,9 @@ use rusb::UsbContext;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,6 +29,13 @@ use std::{
 };
 
 const POLL: Duration = Duration::from_millis(100);
+/// Polling interval for firmware that reports its own control changes; ALSA's
+/// change events wake the owner in between, so this only covers settings that
+/// have no USB Audio control (the monitor mix) and missed events.
+const REPORTED_POLL: Duration = Duration::from_secs(1);
+/// Reported changes arrive in bursts (a dragged slider); polls they request
+/// are spaced at least this far apart.
+const POKE_SPACING: Duration = Duration::from_millis(50);
 const SCAN: Duration = Duration::from_secs(2);
 const ALSA_POLL: Duration = Duration::from_millis(500);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
@@ -339,6 +348,20 @@ impl VendorDevice {
             return Err(OperationError::invalid("USB transfer exceeded buffer"));
         }
         Ok(count)
+    }
+    /// True when the firmware reports control changes itself (patched builds
+    /// 4 and 5); stock firmware refuses the snapshot request.
+    pub fn firmware_reports_changes(&mut self) -> Result<bool> {
+        if self.unit.profile != ProfileId::WaveXlr {
+            return Ok(false);
+        }
+        let mut bytes = [0; protocol::FIRMWARE_SNAPSHOT_LEN];
+        let count = self
+            .transport
+            .read_optional(protocol::FIRMWARE_SNAPSHOT_SELECTOR, &mut bytes)?;
+        Ok(count.is_some_and(|count| {
+            count <= bytes.len() && protocol::firmware_reports_changes(&bytes[..count])
+        }))
     }
     pub fn read_meters(&mut self) -> Result<MeterLevels> {
         let mut bytes = [0; protocol::MAX_METER_LEN];
@@ -710,11 +733,79 @@ trait UnitBackend: Send {
     fn firmware_log(&mut self, _bytes: &mut [u8]) -> Result<Option<usize>> {
         Ok(None)
     }
+    /// Longest wait between two polls of this unit.
+    fn poll_interval(&self) -> Duration {
+        POLL
+    }
+    /// Start calling `poke` when the unit's controls change outside OpenWave,
+    /// for firmware that reports such changes. `poke` requests a poll.
+    fn watch_changes(&mut self, _poke: Arc<dyn Fn() + Send + Sync>) {}
+}
+/// Wakes a unit's owner on every ALSA control change of its card. With a
+/// firmware that reports its own changes, the kernel turns each report into
+/// such an event. `alsactl monitor` flushes every line.
+struct ChangeWatch {
+    child: crate::process::OwnedChild,
+    reader: Option<JoinHandle<()>>,
+    /// False once the monitor's output ended (it exited or never started).
+    alive: Arc<AtomicBool>,
+}
+impl ChangeWatch {
+    fn start(card: u32, poke: Arc<dyn Fn() + Send + Sync>) -> Result<Self> {
+        let mut child = crate::process::OwnedChild::spawn(
+            "alsactl",
+            &["monitor".into(), format!("hw:{card}")],
+            Stdio::piped(),
+        )?;
+        let stdout = child
+            .take_stdout()
+            .ok_or_else(|| OperationError::unavailable("alsactl monitor has no output"))?;
+        let alive = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&alive);
+        let reader = thread::Builder::new()
+            .name("openwave-alsa-watch".into())
+            .spawn(move || watch_lines(BufReader::new(stdout), poke.as_ref(), &flag))?;
+        Ok(Self {
+            child,
+            reader: Some(reader),
+            alive,
+        })
+    }
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+}
+/// Poke for every value change `alsactl monitor` prints; clear `alive` when
+/// its output ends, so the unit falls back to the fast poll.
+fn watch_lines(output: impl BufRead, poke: &(dyn Fn() + Send + Sync), alive: &AtomicBool) {
+    for line in output.lines() {
+        match line {
+            Ok(line) if line.contains(" VALUE") => poke(),
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    alive.store(false, Ordering::Release);
+    // Poll once more at the fast interval now that nothing reports changes.
+    poke();
+}
+impl Drop for ChangeWatch {
+    fn drop(&mut self) {
+        // Ending the child closes its output, which ends the reader.
+        let _ = self.child.terminate();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 struct SyncedDevice {
     vendor: VendorDevice,
     alsa: Option<Box<dyn Alsa>>,
     mirror: Mirror,
+    /// ALSA card of a unit whose firmware reports its own changes. Such a
+    /// unit needs no ALSA mirror: the kernel already learns every change.
+    reporting_card: Option<u32>,
+    watch: Option<ChangeWatch>,
 }
 impl UnitBackend for SyncedDevice {
     fn info(&mut self) -> Result<DeviceInfo> {
@@ -763,6 +854,19 @@ impl UnitBackend for SyncedDevice {
     fn firmware_log(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
         self.vendor.read_firmware_log(bytes)
     }
+    fn poll_interval(&self) -> Duration {
+        if self.watch.as_ref().is_some_and(ChangeWatch::alive) {
+            REPORTED_POLL
+        } else {
+            POLL
+        }
+    }
+    fn watch_changes(&mut self, poke: Arc<dyn Fn() + Send + Sync>) {
+        // Without a watcher the unit keeps the ordinary fast poll.
+        if let Some(card) = self.reporting_card {
+            self.watch = ChangeWatch::start(card, poke).ok();
+        }
+    }
 }
 trait DeviceFactory: Send + Sync {
     fn scan(&self) -> Result<Vec<(ProfileId, u8, u8)>>;
@@ -774,8 +878,14 @@ impl DeviceFactory for NativeFactory {
         VendorDevice::scan()
     }
     fn open(&self, unit: UnitId) -> Result<Box<dyn UnitBackend>> {
-        let vendor = VendorDevice::open(unit)?;
-        let alsa = if unit.profile.profile().legacy.is_some() {
+        let mut vendor = VendorDevice::open(unit)?;
+        // A failed detection only costs the faster poll.
+        let reporting_card = if vendor.firmware_reports_changes().unwrap_or(false) {
+            protocol::card_for_unit(unit, &card_identities(Path::new("/proc/asound"), unit)?)
+        } else {
+            None
+        };
+        let alsa = if reporting_card.is_none() && unit.profile.profile().legacy.is_some() {
             Some(Box::new(CardControls::open(unit)?) as Box<dyn Alsa>)
         } else {
             None
@@ -784,6 +894,8 @@ impl DeviceFactory for NativeFactory {
             vendor,
             alsa,
             mirror: Mirror::default(),
+            reporting_card,
+            watch: None,
         }))
     }
 }
@@ -797,6 +909,8 @@ struct QueueState {
     ready: bool,
     retiring: bool,
     unplugged: bool,
+    /// A change was reported outside OpenWave; poll before waiting again.
+    poll_now: bool,
     jobs: VecDeque<Job>,
 }
 #[derive(Default)]
@@ -822,6 +936,11 @@ impl Queue {
         let mut state = self.lock_state();
         state.ready = false;
         state.retiring = true;
+        self.wake.notify_all();
+    }
+    fn poke(&self) {
+        let mut state = self.lock_state();
+        state.poll_now = true;
         self.wake.notify_all();
     }
 }
@@ -1067,14 +1186,27 @@ fn unit_worker(
                 }
                 state_queue.ready = true;
             }
+            let poked = Arc::clone(&queue);
+            device.watch_changes(Arc::new(move || poked.poke()));
             let _ = events.send(DeviceEvent::Connected(snapshot(unit, &info, state, errors)));
-            let mut next_poll = Instant::now() + POLL;
+            let mut last_poll = Instant::now();
+            let mut next_poll = last_poll + device.poll_interval();
             let mut failures = 0;
             let mut log_reported = false;
             loop {
                 let job = {
                     let mut state = queue.lock_state();
-                    while !state.retiring && state.jobs.is_empty() && Instant::now() < next_poll {
+                    loop {
+                        // A reported change brings the next poll forward, at
+                        // most once per POKE_SPACING, so reports cannot
+                        // starve queued writes.
+                        if state.poll_now {
+                            state.poll_now = false;
+                            next_poll = next_poll.min(last_poll + POKE_SPACING);
+                        }
+                        if state.retiring || !state.jobs.is_empty() || Instant::now() >= next_poll {
+                            break;
+                        }
                         let timeout = next_poll.saturating_duration_since(Instant::now());
                         state = match queue.wake.wait_timeout(state, timeout) {
                             Ok((state, _)) => state,
@@ -1145,7 +1277,8 @@ fn unit_worker(
                             });
                         }
                     }
-                    next_poll = Instant::now() + POLL;
+                    last_poll = Instant::now();
+                    next_poll = last_poll + device.poll_interval();
                 }
             }
             Ok(())

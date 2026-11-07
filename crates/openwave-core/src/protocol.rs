@@ -22,6 +22,21 @@ pub const DOCK_BLOCKS: [(&str, u16, usize); 3] =
 pub const FIRMWARE_LOG_SELECTOR: u16 = 0x004c;
 pub const FIRMWARE_LOG_MAX: usize = 2048;
 
+/// State snapshot of a Wave XLR (007d) running a patched firmware. Stock
+/// firmware refuses (stalls) this request.
+pub const FIRMWARE_SNAPSHOT_SELECTOR: u16 = 0x0053;
+pub const FIRMWARE_SNAPSHOT_LEN: usize = 200;
+
+/// Whether a firmware snapshot comes from a build that reports its own control
+/// changes (mic gain and mute, headphone volume and mute) with USB Audio status
+/// interrupts, so that ALSA follows the knob and touch mute without polling.
+/// Builds 4 and 5 of the patched 1.35 firmware do.
+pub fn firmware_reports_changes(snapshot: &[u8]) -> bool {
+    snapshot.len() >= 0x20
+        && snapshot.starts_with(b"WXS1")
+        && matches!(u16::from_le_bytes([snapshot[0x1e], snapshot[0x1f]]), 4 | 5)
+}
+
 /// Split firmware log bytes into complete lines, carrying an unfinished line
 /// over in `partial`. Lines end in CR LF; CR and other control characters are
 /// dropped, bytes are read as Latin-1 so no input can fail to decode.
@@ -578,7 +593,26 @@ pub fn parse_alsa_volume(output: &str) -> Option<i32> {
 
 #[cfg(test)]
 mod firmware_log_tests {
-    use super::firmware_log_lines;
+    use super::{firmware_log_lines, firmware_reports_changes};
+
+    #[test]
+    fn only_notifying_builds_report_their_own_changes() {
+        let snapshot = |build: u16| {
+            let mut bytes = vec![0; 200];
+            bytes[..4].copy_from_slice(b"WXS1");
+            bytes[0x1e..0x20].copy_from_slice(&build.to_le_bytes());
+            bytes
+        };
+        assert!(firmware_reports_changes(&snapshot(4)));
+        assert!(firmware_reports_changes(&snapshot(5)));
+        for build in [0, 1, 2, 3, 6] {
+            assert!(!firmware_reports_changes(&snapshot(build)), "build {build}");
+        }
+        assert!(!firmware_reports_changes(&snapshot(4)[..0x1f]));
+        let mut wrong = snapshot(4);
+        wrong[0] = b'X';
+        assert!(!firmware_reports_changes(&wrong));
+    }
 
     #[test]
     fn firmware_log_lines_carry_partial_lines_across_reads() {

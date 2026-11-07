@@ -161,6 +161,8 @@ mod device {
                 vendor,
                 alsa: None,
                 mirror: Mirror::default(),
+                reporting_card: None,
+                watch: None,
             },
             memory,
         )
