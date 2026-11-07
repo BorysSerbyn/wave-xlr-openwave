@@ -2,10 +2,10 @@
   <img src="icons/openwave.svg" alt="OpenWave logo" width="128" height="128">
 </p>
 
-<h1 align="center">OpenWave</h1>
+<h1 align="center">OpenWave for the Wave XLR</h1>
 
 <p align="center">
-  <strong>Elgato Wave controls, native to Linux.</strong><br>
+  <strong>OpenWave, adapted for an Elgato Wave XLR running custom patched firmware.</strong><br>
   Built with Rust, GTK4, and libadwaita.
 </p>
 
@@ -16,17 +16,26 @@
   <a href="#how-it-works">How it works</a>
 </p>
 
-OpenWave is an open-source, reverse-engineered alternative to Elgato Wave Link for controlling **Wave XLR**, **XLR Dock**, and **Wave:3** hardware on Linux. Adjust your microphone and headphones from a native desktop app, and route application and capture audio through a PipeWire mixing matrix. OpenWave is an independent project, not an Elgato product.
+This is a fork of [OpenWave](https://github.com/rikkichy/openwave), the open-source, reverse-engineered alternative to Elgato Wave Link for Linux, changed to work with an original **Wave XLR** (`0fd9:007d`) running a custom build of its firmware. That firmware is patched from Elgato's 1.35 (reverse-engineered and decompiled) so that the mic no longer drops out after boot, resume or a replug, and so that the device reports knob and touch-mute changes over USB instead of having to be polled.
+
+**This fork is of little use without that firmware.** It isn't published here; if you have a Wave XLR and want it, message me ([BorysSerbyn](https://github.com/BorysSerbyn)). For stock firmware, or for the XLR Dock and Wave:3, use [upstream OpenWave](https://github.com/rikkichy/openwave). Their code is still here but is only tested upstream.
+
+Not affiliated with Elgato, Corsair or LEWITT; "Elgato" and "Wave XLR" are their trademarks and are used only to name the hardware.
+
+What differs from upstream:
+
+- With the patched firmware, OpenWave follows the device's change notifications and polls once a second as a fallback, instead of polling ten times a second.
+- Last-seen device settings are no longer replayed when a unit reconnects. Instead, an optional **Apply last scene at startup** setting reapplies the scene you last applied or saved, once, when OpenWave starts.
 
 ## Features
 
 - **Multiple devices** — Each supported unit has its own control queue, including two of the same model. The sidebar identifies units by serial, with USB bus/address as a runtime fallback. Selecting another unit does not retarget queued writes.
 - **Microphone controls** — Adjust gain and mute, with 48 V phantom power on supported XLR devices.
 - **Headphone controls** — Set volume, enable low impedance mode on supported devices, or adjust the monitor mix on Wave XLR (`007d`), Wave:3 and XLR Dock MK.2.
-- **Hardware and system sync** — Polling at 10 Hz tracks physical buttons and knobs. Hardware mute and headphone volume synchronize with PipeWire/ALSA.
+- **Hardware and system sync** — Physical buttons and knobs are followed through the patched firmware's change notifications (with a 1 s fallback poll), or by polling at 10 Hz on stock firmware. Hardware mute and headphone volume synchronize with PipeWire/ALSA.
 - **Hotplug and capture readiness** — Adding or removing a device preserves other connected units. The daemon maintains a keepalive per Wave input; the mixer requires raw capture readiness before Wave playback.
 - **Dynamic mixing** — Add application or hardware sources, independent mixes, per-send levels and outputs, with published capture inputs for OBS and voice applications.
-- **Scenes and remote controls** — Recall matrix levels and serial-bound hardware settings, or control the running app through typed session-bus actions. Scenes never include phantom power.
+- **Scenes and remote controls** — Recall matrix levels and serial-bound hardware settings, optionally reapply the last scene at startup, or control the running app through typed session-bus actions. Scenes never include phantom power.
 - **Capture DSP** — Low cut, gate, compression, EQ, delay and optional mono, with cancellable raw-input calibration and explicit proposal acceptance.
 - **System tray and setup** — Keep OpenWave in the background, configure login preferences, and manage native USB/audio integration. Health monitoring is observation-only unless daemon recovery is explicitly enabled.
 
@@ -62,19 +71,15 @@ Keep a voice application's return audio out of the mix selected as its microphon
 
 ### Quick install
 
-On a supported mutable distribution, review the installer before running it. Run as your login user, with `curl`, `git`, and `make` available:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rikkichy/openwave/main/install.sh | sh
-```
+Upstream's one-line installer installs upstream OpenWave, not this fork. Install this fork from a checkout (next section), as your login user, with `git` and `make` available.
 
 The installer supports **Arch, Debian/Ubuntu, Fedora, openSUSE, or Void** when the required library versions are available. It installs native dependencies and Rust **1.98.1**, then builds and stages the application as your login user. Only dependency installation and system-file copying request administrator authorization through sudo, doas or pkexec. The default prefix is `/usr/local`; final privileged copying uses a validated root-owned bootstrap, never an elevated Cargo build. **Do not run the installer or GUI as root, or use `sudo make install`.**
 
 ### Install from a checkout
 
 ```bash
-git clone https://github.com/rikkichy/openwave.git
-cd openwave
+git clone https://github.com/BorysSerbyn/wave-xlr-openwave.git
+cd wave-xlr-openwave
 ./install.sh
 ```
 
@@ -117,12 +122,12 @@ cargo build --locked --workspace --bins
 ### Nix
 
 ```bash
-nix run github:rikkichy/openwave
+nix run github:BorysSerbyn/wave-xlr-openwave
 ```
 
 The flake exports `packages.x86_64-linux.openwave` and its default package. On NixOS, add the package to `services.udev.packages` for declarative USB permissions, as well as installing it for your user. Launchers carry runtime tool paths and the LADSPA search path. Building a package does not establish physical acceptance for every enabled device profile.
 
-To use the pinned prebuilt release instead of compiling Rust:
+The pinned prebuilt release is upstream's build, without this fork's changes:
 
 ```bash
 nix run github:rikkichy/openwave#openwave-bin
@@ -282,7 +287,7 @@ openwave-diag -o openwave-diagnostics.txt
 
 From a built checkout, use `./target/debug/openwave-diag -o openwave-diagnostics.txt`. Reports include the native compiler/build target; no interpreter or module-path setup is needed.
 
-Diagnostics do not open USB vendor handles unless `--device` is supplied. `--full` adds private details, **not** USB permission. Close OpenWave before `--device`; review reports before posting to [the issue tracker](https://github.com/rikkichy/openwave/issues). See [diagnostic privacy](docs/troubleshooting.md).
+Diagnostics do not open USB vendor handles unless `--device` is supplied. `--full` adds private details, **not** USB permission. Close OpenWave before `--device`; review reports before posting them to [this fork's issue tracker](https://github.com/BorysSerbyn/wave-xlr-openwave/issues), or upstream's for problems that also happen there. See [diagnostic privacy](docs/troubleshooting.md).
 
 ## Architecture
 
