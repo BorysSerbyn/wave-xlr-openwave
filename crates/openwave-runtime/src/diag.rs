@@ -382,7 +382,6 @@ pub fn collect_configs(root: &Path, full: bool) -> Result<String> {
         "mixes.json",
         "scenes.json",
         "ui-state.json",
-        "devices.json",
     ] {
         let path = root.join(name);
         let metadata = match fs::metadata(&path) {

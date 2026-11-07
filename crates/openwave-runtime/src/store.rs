@@ -158,7 +158,6 @@ pub struct ConfigStore {
     pub matrix: Stored<MatrixState>,
     pub preferences: Stored<Preferences>,
     pub scenes: Stored<IndexMap<SceneId, Scene>>,
-    pub devices: Stored<scenes::RememberedHardware>,
 }
 impl ConfigStore {
     pub fn load(root: &Path) -> Self {
@@ -198,13 +197,6 @@ impl ConfigStore {
                 scenes::encode_store,
                 false,
             ),
-            devices: Stored::load(
-                root.join("devices.json"),
-                IndexMap::new(),
-                scenes::decode_remembered,
-                scenes::encode_remembered,
-                false,
-            ),
         }
     }
     pub fn routing_available(&self) -> bool {
@@ -229,7 +221,6 @@ impl ConfigStore {
             self.matrix.error(),
             self.preferences.error(),
             self.scenes.error(),
-            self.devices.error(),
         ]
         .into_iter()
         .flatten()
