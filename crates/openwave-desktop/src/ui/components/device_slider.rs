@@ -30,6 +30,9 @@ impl DeviceSlider {
         widget.set_margin_end(12);
         widget.set_margin_top(2);
         widget.set_margin_bottom(6);
+        // The sidebar scrolls; a wheel turn over a slider must not change a
+        // hardware setting.
+        super::pass_wheel_to_pane(&widget);
         let slider_row = adw::PreferencesRow::builder()
             .activatable(false)
             .selectable(false)
