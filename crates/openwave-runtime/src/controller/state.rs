@@ -65,6 +65,10 @@ struct DeviceJob {
     open_sources: Vec<(SourceId, String, String)>,
 }
 
+/// Longest wait at startup for the audio graph and the units the last scene
+/// names; after it the scene is applied with whatever is present.
+const STARTUP_SCENE_WAIT: Duration = Duration::from_secs(15);
+
 struct Controller {
     store: ConfigStore,
     backend: Box<dyn Backend>,
@@ -103,6 +107,9 @@ struct Controller {
     meters_dirty: bool,
     firmware_partial: HashMap<UnitId, String>,
     firmware_lines: std::collections::VecDeque<String>,
+    /// The last used scene, applied once after startup, and the deadline for
+    /// waiting on the units it names.
+    startup_scene: Option<(SceneId, Instant)>,
 }
 
 pub(super) fn start(
@@ -189,6 +196,16 @@ impl Controller {
         events: EventPublisher,
     ) -> Self {
         let errors = store.issues();
+        let startup_scene = {
+            let preferences = store.preferences.value();
+            preferences
+                .last_scene
+                .clone()
+                .filter(|_| preferences.apply_scene_at_startup)
+                .and_then(|id| SceneId::new(id).ok())
+                .filter(|id| store.scenes.value().contains_key(id))
+                .map(|id| (id, Instant::now() + STARTUP_SCENE_WAIT))
+        };
         let view = AppSnapshot {
             revision: 1,
             desired: Arc::new(store.desired()),
@@ -236,6 +253,7 @@ impl Controller {
             meters_dirty: false,
             firmware_partial: HashMap::new(),
             firmware_lines: Default::default(),
+            startup_scene,
         };
         state.refresh_bindings();
         state.route();
@@ -249,6 +267,7 @@ impl Controller {
                 };
                 self.observe(event);
             }
+            self.apply_startup_scene();
             let now = Instant::now();
             let due: Vec<_> = self
                 .pending
@@ -289,6 +308,82 @@ impl Controller {
         drop(admission);
         for request in receiver.try_iter() {
             self.events.complete(request.id, CommandOutcome::Cancelled);
+        }
+    }
+    /// Apply the last used scene once the audio graph is known and every unit
+    /// it names is connected with a known state, or once the wait is over.
+    fn apply_startup_scene(&mut self) {
+        let Some((scene, deadline)) = &self.startup_scene else {
+            return;
+        };
+        if Instant::now() < *deadline {
+            if self.graph_observation.known().is_none() {
+                return;
+            }
+            if let Some(hardware) = self
+                .store
+                .scenes
+                .value()
+                .get(scene)
+                .and_then(|scene| scene.hardware.as_ref())
+            {
+                let candidates: Vec<_> = self
+                    .units
+                    .values()
+                    .filter(|unit| unit.state.known().is_some())
+                    .map(|unit| scenes::HardwareCandidate {
+                        unit: unit.id,
+                        serial: &unit.info.serial,
+                    })
+                    .collect();
+                if !scenes::resolve_hardware(hardware, &candidates)
+                    .skipped
+                    .is_empty()
+                {
+                    return;
+                }
+            }
+        }
+        let Some((scene, _)) = self.startup_scene.take() else {
+            return;
+        };
+        let id = {
+            let mut admission = self
+                .shared
+                .admission
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !admission.accepting || admission.stopped {
+                return;
+            }
+            let id = CommandId(admission.next_command);
+            let Some(next) = admission.next_command.checked_add(1) else {
+                return;
+            };
+            admission.next_command = next;
+            id
+        };
+        log::info!("Applying the last used scene {scene} at startup");
+        self.accept(CommandEnvelope {
+            id,
+            command: AppCommand::ApplyScene { scene },
+        });
+    }
+    /// Remember which scene was used last; failing to save it never fails the
+    /// scene itself.
+    fn set_last_scene(&mut self, scene: Option<&SceneId>) {
+        let value = scene.map(|id| id.as_str().to_owned());
+        if self.store.preferences.value().last_scene == value {
+            return;
+        }
+        let mut preferences = self.store.preferences.value().clone();
+        preferences.last_scene = value;
+        match self.store.preferences.replace(preferences) {
+            Ok(()) => {
+                self.view.preferences = Arc::new(self.store.preferences.value().clone());
+                self.dirty = true;
+            }
+            Err(error) => self.issue("preferences", error),
         }
     }
     fn accept(&mut self, request: CommandEnvelope) {

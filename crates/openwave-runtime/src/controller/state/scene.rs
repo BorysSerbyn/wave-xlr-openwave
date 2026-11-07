@@ -109,8 +109,10 @@ impl Controller {
         };
         scene.validate()?;
         let mut saved = self.store.scenes.value().clone();
-        saved.insert(SceneId::from_name(name), scene);
+        let id = SceneId::from_name(name);
+        saved.insert(id.clone(), scene);
         self.store.scenes.replace(saved)?;
+        self.set_last_scene(Some(&id));
         self.refresh_desired();
         self.route();
         Ok(())
@@ -123,6 +125,9 @@ impl Controller {
             return Err(OperationError::invalid(format!("Unknown scene: {id}")));
         }
         self.store.scenes.replace(saved)?;
+        if self.store.preferences.value().last_scene.as_deref() == Some(id.as_str()) {
+            self.set_last_scene(None);
+        }
         self.refresh_desired();
         self.route();
         Ok(())
@@ -146,6 +151,7 @@ impl Controller {
         self.view.scene_outcome = None;
         self.view.scene_pending = true;
         self.dirty = true;
+        self.set_last_scene(Some(id));
 
         let empty = IndexMap::new();
         let hardware = scene.hardware.as_ref().unwrap_or(&empty);

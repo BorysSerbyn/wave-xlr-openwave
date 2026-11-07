@@ -723,3 +723,115 @@ fn recall_supersedes_only_its_pending_cell_and_device_fields() {
     assert_eq!(matrix["b.personal"]["volume"], 0.3);
     assert_eq!(matrix["b.personal"]["muted"], true);
 }
+
+const STARTUP_SCENE: &str = r#"{"name":"Recall","volumes":{"personal":{"volume":0.25}},"hardware":{"wave_xlr:A":{"gain_raw":2560,"hp_volume_db":-20.0}}}"#;
+
+fn scene_finished(f: &Fixture) -> CommandOutcome {
+    loop {
+        let (_, outcome) = f
+            .completed
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scene completion deadline");
+        if matches!(outcome, CommandOutcome::SceneFinished { .. }) {
+            return outcome;
+        }
+    }
+}
+
+#[test]
+fn applying_saving_and_deleting_scenes_track_the_last_used_scene() {
+    let mut f = Fixture::new(serde_json::from_str(STARTUP_SCENE).unwrap(), None);
+    let a = unit(ProfileId::WaveXlr, 1, "A", false);
+    let b = unit(ProfileId::Wave3, 2, "B", false);
+    f.connect(&[a, b], true);
+    let id = f.apply();
+    f.finish_job(&f.job(), false);
+    assert!(matches!(
+        f.outcome(id),
+        CommandOutcome::SceneFinished { .. }
+    ));
+    assert_eq!(f.read("ui-state.json")["last_scene"], "recall");
+    let saved = f.submit(AppCommand::SaveScene {
+        name: "Evening".into(),
+    });
+    assert!(matches!(f.outcome(saved), CommandOutcome::Applied { .. }));
+    assert_eq!(f.read("ui-state.json")["last_scene"], "evening");
+    let deleted = f.submit(AppCommand::DeleteScene {
+        scene: SceneId::new("evening").unwrap(),
+    });
+    assert!(matches!(f.outcome(deleted), CommandOutcome::Applied { .. }));
+    assert!(f.read("ui-state.json").get("last_scene").is_none());
+}
+
+#[test]
+fn the_last_scene_is_applied_once_at_startup_when_its_unit_is_known() {
+    let f = Fixture::new(
+        serde_json::from_str(STARTUP_SCENE).unwrap(),
+        Some((
+            "ui-state.json",
+            r#"{"apply_scene_at_startup":true,"last_scene":"recall"}"#,
+        )),
+    );
+    // Nothing happens before the unit the scene names is known.
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        f.outgoing
+            .try_iter()
+            .all(|command| !matches!(command, BackendCommand::Device { .. }))
+    );
+    let a = unit(ProfileId::WaveXlr, 1, "A", true);
+    let b = unit(ProfileId::Wave3, 2, "B", false);
+    f.connect(&[a.clone(), b.clone()], true);
+    let job = f.job();
+    assert_eq!(job.1, a.id);
+    assert_eq!(
+        job.2,
+        vec![
+            DeviceSetting::GainRaw(2560),
+            DeviceSetting::HeadphoneDb(-20.0)
+        ]
+    );
+    f.finish_job(&job, false);
+    let (skipped, failed) = scene_result(scene_finished(&f));
+    assert!(skipped.is_empty() && failed.is_empty());
+    assert_eq!(f.read("mixes.json")["volumes"]["personal"]["volume"], 0.25);
+    // A reconnect does not apply it again.
+    f.incoming.send(BackendEvent::UnitRetired(a.id)).unwrap();
+    f.wait_snapshot(|snapshot| snapshot.units.len() == 1);
+    let mut again = a.clone();
+    again.id.incarnation = 2;
+    f.connect(&[again.clone(), b], true);
+    thread::sleep(Duration::from_millis(100));
+    // (Group mute mirroring may still write mute to the other unit.)
+    for command in f.outgoing.try_iter() {
+        if let BackendCommand::Device { unit, settings, .. } = command {
+            assert!(
+                unit != again.id && !settings.contains(&DeviceSetting::GainRaw(2560)),
+                "scene applied again after a reconnect: {unit:?} {settings:?}"
+            );
+        }
+    }
+    assert!(
+        f.completed
+            .try_iter()
+            .all(|(_, outcome)| !matches!(outcome, CommandOutcome::SceneFinished { .. }))
+    );
+}
+
+#[test]
+fn the_last_scene_is_not_applied_at_startup_when_the_setting_is_off() {
+    let f = Fixture::new(
+        serde_json::from_str(STARTUP_SCENE).unwrap(),
+        Some(("ui-state.json", r#"{"last_scene":"recall"}"#)),
+    );
+    let a = unit(ProfileId::WaveXlr, 1, "A", true);
+    let b = unit(ProfileId::Wave3, 2, "B", false);
+    f.connect(&[a, b], true);
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        f.outgoing
+            .try_iter()
+            .all(|command| !matches!(command, BackendCommand::Device { .. }))
+    );
+    assert!(f.completed.try_recv().is_err());
+}

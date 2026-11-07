@@ -8,6 +8,7 @@ use adw::prelude::*;
 use openwave_core::{
     model::{AppSnapshot, DeviceSetting, Lifecycle, PreferencesEdit, UnitId, UnitSnapshot},
     protocol::KnobMode,
+    scenes::SceneId,
 };
 use openwave_runtime::controller::{AppCommand, EditTiming};
 
@@ -36,6 +37,7 @@ pub struct Sidebar {
     monitor: DeviceSlider,
     autostart: adw::SwitchRow,
     hidden_autostart: adw::SwitchRow,
+    startup_scene: adw::SwitchRow,
     tray_color: adw::ComboRow,
     info: adw::ExpanderRow,
     firmware: gtk::Label,
@@ -224,6 +226,10 @@ impl Sidebar {
             .subtitle("No window on login; open it from the tray icon")
             .build();
         settings.add(&hidden_autostart);
+        let startup_scene = adw::SwitchRow::builder()
+            .title("Apply last scene at startup")
+            .build();
+        settings.add(&startup_scene);
         let colors = gtk::StringList::new(&["White", "Black"]);
         let tray_color = adw::ComboRow::builder()
             .title("Tray icon color")
@@ -351,6 +357,28 @@ impl Sidebar {
         }
         {
             let interaction = interaction.clone();
+            let submit = submit.clone();
+            startup_scene.connect_active_notify(move |row| {
+                if !interaction.accepting()
+                    || row.is_active()
+                        == interaction
+                            .snapshot
+                            .borrow()
+                            .preferences
+                            .apply_scene_at_startup
+                {
+                    return;
+                }
+                submit(AppCommand::SetPreferences {
+                    changes: PreferencesEdit {
+                        apply_scene_at_startup: Some(row.is_active()),
+                        ..PreferencesEdit::default()
+                    },
+                });
+            });
+        }
+        {
+            let interaction = interaction.clone();
             tray_color.connect_selected_notify(move |row| {
                 if !interaction.accepting() {
                     return;
@@ -389,6 +417,7 @@ impl Sidebar {
             monitor,
             autostart,
             hidden_autostart,
+            startup_scene,
             tray_color,
             info,
             firmware,
@@ -495,6 +524,22 @@ impl Sidebar {
         self.hidden_autostart.set_active(snapshot.hidden_autostart);
         self.hidden_autostart
             .set_sensitive(accepting && snapshot.autostart);
+        self.startup_scene
+            .set_active(snapshot.preferences.apply_scene_at_startup);
+        self.startup_scene.set_sensitive(accepting);
+        let last = snapshot
+            .preferences
+            .last_scene
+            .as_ref()
+            .and_then(|id| SceneId::new(id.as_str()).ok())
+            .and_then(|id| snapshot.desired.scenes.get(&id));
+        self.startup_scene.set_subtitle(&match last {
+            Some(scene) => format!(
+                "Reapplies “{}”, the scene last applied or saved",
+                scene.name
+            ),
+            None => "Applies the scene you last applied or saved; none yet".into(),
+        });
         self.tray_color.set_sensitive(accepting);
         // Artwork availability must never select or persist a different preference.
         self.tray_color

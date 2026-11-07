@@ -400,6 +400,9 @@ impl Controller {
                 if let Some(color) = changes.tray_icon_color {
                     preferences.tray_icon_color = color;
                 }
+                if let Some(startup) = changes.apply_scene_at_startup {
+                    preferences.apply_scene_at_startup = startup;
+                }
                 self.store.preferences.replace(preferences)?;
                 self.view.preferences = Arc::new(self.store.preferences.value().clone());
                 self.dirty = true;

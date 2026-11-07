@@ -604,6 +604,11 @@ pub struct Preferences {
     pub offered_capture_nodes: Vec<String>,
     pub gain_locked: bool,
     pub tray_icon_color: String,
+    /// Apply `last_scene` once when OpenWave starts.
+    pub apply_scene_at_startup: bool,
+    /// ID of the scene applied or saved most recently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_scene: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -616,6 +621,8 @@ impl Default for Preferences {
             offered_capture_nodes: Vec::new(),
             gain_locked: false,
             tray_icon_color: "white".into(),
+            apply_scene_at_startup: false,
+            last_scene: None,
             extra: Map::new(),
         }
     }
@@ -639,6 +646,16 @@ impl Preferences {
         }
         prefs.maximized = take_bool(&mut map, "maximized", false)?;
         prefs.gain_locked = take_bool(&mut map, "gain_locked", false)?;
+        prefs.apply_scene_at_startup = take_bool(&mut map, "apply_scene_at_startup", false)?;
+        prefs.last_scene = match map.remove("last_scene") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id),
+            Some(_) => {
+                return Err(OperationError::invalid(
+                    "last_scene must be a nonempty string",
+                ));
+            }
+        };
         prefs.tray_icon_color = take_string(&mut map, "tray_icon_color", "white")?;
         if !["white", "black"].contains(&prefs.tray_icon_color.as_str()) {
             return Err(OperationError::invalid(
@@ -659,6 +676,7 @@ pub struct PreferencesEdit {
     pub maximized: Option<bool>,
     pub offered_capture_nodes: Option<Vec<String>>,
     pub tray_icon_color: Option<String>,
+    pub apply_scene_at_startup: Option<bool>,
 }
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DesiredState {
