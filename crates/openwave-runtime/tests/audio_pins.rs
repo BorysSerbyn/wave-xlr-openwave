@@ -1,4 +1,7 @@
-use openwave_runtime::audio::{PinAction, PinStatus, PinWatch, aggregate_status, capture_nodes};
+use openwave_runtime::audio::{
+    PinAction, PinStatus, PinWatch, REARM, RouteMemory, WaveRoute, aggregate_status,
+    arm_route_args, capture_nodes, wave_routes,
+};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 fn at(start: Instant, seconds: u64) -> Instant {
@@ -184,4 +187,106 @@ fn daemon_informational_paths_create_no_runtime_or_audio_state() {
         );
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
+}
+
+fn card(id: u32, name: &str, api: &str, routes: Value) -> Value {
+    json!({
+        "id": id,
+        "type": "PipeWire:Interface:Device",
+        "info": {
+            "props": {"device.api": api, "device.name": name},
+            "params": {"Route": routes}
+        }
+    })
+}
+fn wave_graph(object: u32) -> Value {
+    json!([
+        card(
+            object,
+            "alsa_card.usb-Elgato_Systems_Elgato_Wave_XLR_A01DA401224UGC-00",
+            "alsa",
+            json!([
+                {"index": 1, "device": 1, "direction": "Input", "name": "analog-input-mic",
+                 "save": false, "props": {"channelVolumes": [1.0]}},
+                {"index": 0, "device": 0, "direction": "Output", "name": "analog-output",
+                 "save": true, "props": {"channelVolumes": [0.68]}}
+            ])
+        ),
+        card(
+            60,
+            "alsa_card.pci-0000_0c_00.4",
+            "alsa",
+            json!([{"index": 2, "device": 3, "name": "analog-output-headphones", "save": false}])
+        ),
+        card(
+            61,
+            "bluez_card.Elgato_Systems_Elgato_Wave",
+            "bluez5",
+            json!([{"index": 0, "device": 0, "name": "headset", "save": false}])
+        ),
+        {"id": 62, "type": "PipeWire:Interface:Node",
+         "info": {"props": {"node.name": "alsa_input.usb-Elgato_Systems_Elgato_Wave_XLR"}}}
+    ])
+}
+
+#[test]
+fn only_the_active_routes_of_wave_cards_are_kept_in_memory() {
+    let routes = wave_routes(&wave_graph(57));
+    assert_eq!(
+        routes,
+        vec![
+            WaveRoute {
+                object: 57,
+                index: 1,
+                device: 1,
+                name: "analog-input-mic".into()
+            },
+            WaveRoute {
+                object: 57,
+                index: 0,
+                device: 0,
+                name: "analog-output".into()
+            },
+        ]
+    );
+    assert!(wave_routes(&json!({"not": "a graph"})).is_empty());
+    assert_eq!(
+        arm_route_args(&routes[0]),
+        vec![
+            "set-param".to_string(),
+            "57".into(),
+            "Route".into(),
+            r#"{ "index": 1, "device": 1, "save": true }"#.into()
+        ]
+    );
+}
+
+#[test]
+fn routes_are_armed_when_they_appear_and_again_after_a_while() {
+    let now = Instant::now();
+    let mut memory = RouteMemory::default();
+    let routes = wave_routes(&wave_graph(57));
+    assert_eq!(
+        memory.due(&routes, now),
+        routes,
+        "new routes are armed at once"
+    );
+    assert!(memory.due(&routes, now + Duration::from_secs(1)).is_empty());
+    assert!(
+        memory
+            .due(&routes, now + REARM - Duration::from_millis(1))
+            .is_empty()
+    );
+    assert_eq!(
+        memory.due(&routes, now + REARM),
+        routes,
+        "rearmed after REARM"
+    );
+
+    // A restart or replug brings a new device object: arm it immediately.
+    let later = now + REARM + Duration::from_secs(1);
+    let replugged = wave_routes(&wave_graph(91));
+    assert_eq!(memory.due(&replugged, later), replugged);
+    // Forgotten routes do not linger; the old object coming back counts as new.
+    assert_eq!(memory.due(&routes, later), routes);
 }

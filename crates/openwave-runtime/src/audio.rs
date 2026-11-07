@@ -24,6 +24,10 @@ const STARTUP: Duration = Duration::from_secs(1);
 const WEDGE: Duration = Duration::from_secs(3);
 const SILENCE: Duration = Duration::from_secs(30);
 const MUTE_RECHECK: Duration = Duration::from_secs(5);
+/// How long an armed Wave route is trusted to stay armed. WirePlumber's own
+/// restore (after a wake, replug or restart) disarms it without any visible
+/// change, so it is armed again on this interval.
+pub const REARM: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PinStatus {
@@ -193,6 +197,113 @@ pub fn capture_nodes(value: &Value) -> Result<Vec<CaptureNode>> {
             })
         })
         .collect()
+}
+/// An active route (mic or headphone path) of a Wave card in PipeWire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaveRoute {
+    /// PipeWire device object.
+    pub object: u32,
+    /// Route index and the card device it belongs to.
+    pub index: u32,
+    pub device: u32,
+    pub name: String,
+}
+/// Active routes of the Wave cards in a pw-dump.
+///
+/// WirePlumber stores a route's volume only while the route carries a "save"
+/// flag. A volume change made through a desktop mixer sets it; WirePlumber's
+/// own restore clears it. A Wave is adjusted with its knobs, so its flag stays
+/// clear, the volume the device reports is never stored, and the next restore
+/// writes a stale value (100% for an unsaved mic, which is maximum gain).
+pub fn wave_routes(value: &Value) -> Vec<WaveRoute> {
+    let Some(objects) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut routes = Vec::new();
+    for object in objects {
+        let props = &object["info"]["props"];
+        let is_wave = object["type"].as_str() == Some("PipeWire:Interface:Device")
+            && props["device.api"].as_str() == Some("alsa")
+            && props["device.name"].as_str().is_some_and(|name| {
+                name.starts_with("alsa_card.usb-Elgato_Systems_Elgato_Wave")
+                    || name.starts_with("alsa_card.usb-Elgato_Systems_Elgato_XLR_Dock")
+            });
+        let (true, Some(id)) = (is_wave, integer(&object["id"])) else {
+            continue;
+        };
+        for route in object["info"]["params"]["Route"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(index), Some(device)) =
+                (integer(&route["index"]), integer(&route["device"]))
+            {
+                routes.push(WaveRoute {
+                    object: id,
+                    index,
+                    device,
+                    name: route["name"].as_str().unwrap_or_default().to_owned(),
+                });
+            }
+        }
+    }
+    routes
+}
+/// Keeps WirePlumber's save flag set on the Wave routes, so the volume and
+/// gain the device reports (knob, touch mute, OpenWave) are what WirePlumber
+/// stores and restores. Arming changes no volume and writes nothing to the
+/// device; it only marks the route as one to remember.
+#[derive(Debug, Default)]
+pub struct RouteMemory {
+    armed: HashMap<(u32, u32, u32), Instant>,
+}
+impl RouteMemory {
+    /// Routes to arm now: new ones at once, the rest every [`REARM`].
+    pub fn due(&mut self, routes: &[WaveRoute], now: Instant) -> Vec<WaveRoute> {
+        self.armed.retain(|key, _| {
+            routes
+                .iter()
+                .any(|route| (route.object, route.index, route.device) == *key)
+        });
+        routes
+            .iter()
+            .filter(|route| {
+                let key = (route.object, route.index, route.device);
+                match self.armed.get(&key) {
+                    Some(at) if now.saturating_duration_since(*at) < REARM => false,
+                    _ => {
+                        self.armed.insert(key, now);
+                        true
+                    }
+                }
+            })
+            .cloned()
+            .collect()
+    }
+}
+/// pw-cli arguments that set only the route's save flag.
+pub fn arm_route_args(route: &WaveRoute) -> Vec<String> {
+    vec![
+        "set-param".into(),
+        route.object.to_string(),
+        "Route".into(),
+        format!(
+            "{{ \"index\": {}, \"device\": {}, \"save\": true }}",
+            route.index, route.device
+        ),
+    ]
+}
+fn arm_routes(runner: &CommandRunner, memory: &mut RouteMemory, graph: &Value, now: Instant) {
+    for route in memory.due(&wave_routes(graph), now) {
+        if let Err(error) = runner.run("pw-cli", &arm_route_args(&route), Duration::from_secs(3)) {
+            log::warn!(
+                "Could not ask WirePlumber to remember {} of device {}: {error}",
+                route.name,
+                route.object
+            );
+        }
+    }
 }
 fn integer(value: &Value) -> Option<u32> {
     value
@@ -427,15 +538,19 @@ fn audio_loop(
     let mut previous = None;
     let mut absent_retry = Duration::from_millis(100);
     let mut shutdown_errors = Vec::new();
+    let mut memory = RouteMemory::default();
     while !cancel.load(Ordering::Acquire) {
-        let observation = runner
+        let graph = runner
             .run("pw-dump", &["--no-colors".into()], Duration::from_secs(3))
-            .and_then(|output| Ok(serde_json::from_slice::<Value>(&output.stdout)?))
-            .and_then(|value| capture_nodes(&value));
+            .and_then(|output| Ok(serde_json::from_slice::<Value>(&output.stdout)?));
         if cancel.load(Ordering::Acquire) {
             break;
         }
         let now = Instant::now();
+        if let Ok(graph) = &graph {
+            arm_routes(&runner, &mut memory, graph, now);
+        }
+        let observation = graph.and_then(|value| capture_nodes(&value));
         let nodes = match observation {
             Ok(nodes) => nodes,
             Err(error) => {

@@ -25,6 +25,7 @@ Not affiliated with Elgato, Corsair or LEWITT; "Elgato" and "Wave XLR" are their
 What differs from upstream:
 
 - With the patched firmware, OpenWave follows the device's change notifications and polls once a second as a fallback, instead of polling ten times a second.
+- The audio daemon keeps WirePlumber's "save" flag set on the Wave's mic and headphone routes, so the volume and gain the device reports are what WirePlumber restores after a wake, replug or restart (otherwise it restores a stale value, often 75 dB of gain). It changes no volume itself.
 - Last-seen device settings are no longer replayed when a unit reconnects. Instead, an optional **Apply last scene at startup** setting reapplies the scene you last applied or saved, once, when OpenWave starts.
 
 ## Features
