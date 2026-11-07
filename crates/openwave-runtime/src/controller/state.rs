@@ -17,6 +17,9 @@ mod mutations;
 mod mutes;
 mod scene;
 
+/// Firmware log lines kept for views that open later or fell behind.
+const FIRMWARE_LOG_LINES: usize = 2000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum SettingField {
     Gain,
@@ -108,6 +111,8 @@ struct Controller {
     stopped: bool,
     dirty: bool,
     meters_dirty: bool,
+    firmware_partial: HashMap<UnitId, String>,
+    firmware_lines: std::collections::VecDeque<String>,
 }
 
 pub(super) fn start(
@@ -243,6 +248,8 @@ impl Controller {
             stopped: false,
             dirty: true,
             meters_dirty: false,
+            firmware_partial: HashMap::new(),
+            firmware_lines: Default::default(),
         };
         state.refresh_bindings();
         state.route();
@@ -1185,7 +1192,36 @@ impl Controller {
                 self.dirty = true;
             }
             BackendEvent::Error(issue) => self.issue(issue.target, issue.message),
+            BackendEvent::FirmwareLog { unit, result } => self.observe_firmware_log(unit, result),
         }
         self.advance_handovers();
+    }
+    fn observe_firmware_log(&mut self, unit: UnitId, result: Result<Vec<u8>>) {
+        if !self.view.firmware_log.enabled {
+            return;
+        }
+        match result {
+            Ok(bytes) => {
+                let partial = self.firmware_partial.entry(unit).or_default();
+                let lines = openwave_core::protocol::firmware_log_lines(partial, &bytes);
+                let mut first = self.view.firmware_log.first;
+                for line in lines {
+                    if self.firmware_lines.len() == FIRMWARE_LOG_LINES {
+                        self.firmware_lines.pop_front();
+                        first += 1;
+                    }
+                    self.firmware_lines.push_back(line);
+                }
+                let log = &mut self.view.firmware_log;
+                log.first = first;
+                log.lines = Arc::new(self.firmware_lines.clone());
+                log.status.clear();
+            }
+            Err(error) => {
+                let name = unit.profile.profile().display_name;
+                self.view.firmware_log.status = format!("{name}: {error}");
+            }
+        }
+        self.dirty = true;
     }
 }

@@ -448,6 +448,25 @@ impl Controller {
                 self.dirty = true;
             }
             AppCommand::Reconnect => self.backend.dispatch(BackendCommand::Rescan)?,
+            AppCommand::SetFirmwareLog { enabled } => {
+                self.backend
+                    .dispatch(BackendCommand::FirmwareLog { enabled })?;
+                let log = &mut self.view.firmware_log;
+                log.enabled = enabled;
+                log.status = if !enabled {
+                    String::new()
+                } else if self
+                    .units
+                    .keys()
+                    .any(|unit| unit.profile == openwave_core::profiles::ProfileId::WaveXlr)
+                {
+                    "Waiting for the device's log…".into()
+                } else {
+                    "No original Wave XLR (0fd9:007d) is connected; only it can offer a firmware log.".into()
+                };
+                self.firmware_partial.clear();
+                self.dirty = true;
+            }
             AppCommand::Shutdown => self.shutdown(id, None),
             AppCommand::PrepareUninstall { canonical_identity } => {
                 if self.backend.identity().as_os_str() != std::ffi::OsStr::new(&canonical_identity)

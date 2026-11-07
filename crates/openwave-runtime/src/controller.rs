@@ -164,6 +164,10 @@ pub enum AppCommand {
     Reconnect,
     RunSetup,
     ContinueSetup,
+    /// Read connected devices' own firmware logs, where the firmware offers one.
+    SetFirmwareLog {
+        enabled: bool,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("Shutdown incomplete: {message}")]
@@ -364,6 +368,9 @@ pub enum BackendCommand {
     },
     Rescan,
     Activate,
+    FirmwareLog {
+        enabled: bool,
+    },
 }
 
 pub enum BackendEvent {
@@ -399,6 +406,10 @@ pub enum BackendEvent {
         usb_update: bool,
     },
     Error(OperationIssue),
+    FirmwareLog {
+        unit: UnitId,
+        result: Result<Vec<u8>>,
+    },
 }
 
 pub trait Backend: Send {

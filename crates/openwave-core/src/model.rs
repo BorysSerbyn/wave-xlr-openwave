@@ -7,7 +7,11 @@ use crate::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::{collections::HashSet, fmt, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    fmt,
+    sync::Arc,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -761,6 +765,25 @@ pub enum SetupPhase {
     ActivationFailed(String),
     Ready,
 }
+/// Recent lines of a device's own firmware log, for devices running a firmware
+/// that exposes one. Lines are numbered across the session so a view can append
+/// only what it has not shown yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FirmwareLogView {
+    /// The user asked OpenWave to read device logs.
+    pub enabled: bool,
+    /// Why no log is arriving, when known; empty while lines arrive.
+    pub status: String,
+    /// Sequence number of `lines[0]`.
+    pub first: u64,
+    pub lines: Arc<VecDeque<String>>,
+}
+impl FirmwareLogView {
+    /// Sequence number the next appended line will get.
+    pub fn next(&self) -> u64 {
+        self.first + self.lines.len() as u64
+    }
+}
 #[derive(Debug, Clone)]
 pub struct AppSnapshot {
     pub revision: u64,
@@ -786,6 +809,7 @@ pub struct AppSnapshot {
     pub pending_fx: Arc<IndexMap<SourceId, FxSettings>>,
     pub setup_phase: SetupPhase,
     pub scene_pending: bool,
+    pub firmware_log: FirmwareLogView,
 }
 impl Default for AppSnapshot {
     fn default() -> Self {
@@ -813,6 +837,7 @@ impl Default for AppSnapshot {
             pending_fx: Arc::default(),
             setup_phase: SetupPhase::Checking,
             scene_pending: false,
+            firmware_log: FirmwareLogView::default(),
         }
     }
 }

@@ -11,7 +11,7 @@ mod device {
         }
     }
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::atomic::AtomicUsize;
     struct Fixture {
         found: Mutex<Vec<(ProfileId, u8, u8)>>,
         writes: mpsc::Sender<(UnitId, Vec<DeviceSetting>)>,
@@ -22,6 +22,8 @@ mod device {
         fail_polls: AtomicBool,
         failed_polls: AtomicUsize,
         opens: AtomicUsize,
+        /// `None` behaves like stock firmware, which refuses the log request.
+        firmware_log: Mutex<Option<Vec<u8>>>,
     }
     struct ReleaseGate(Arc<Fixture>);
     impl Drop for ReleaseGate {
@@ -101,6 +103,16 @@ mod device {
         fn unresponsive(&self) -> bool {
             self.fixture.fail_polls.load(Ordering::SeqCst)
         }
+        fn firmware_log(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+            Ok(fixture_lock(&self.fixture.firmware_log)
+                .as_mut()
+                .map(|log| {
+                    let count = log.len().min(bytes.len());
+                    bytes[..count].copy_from_slice(&log[..count]);
+                    log.drain(..count);
+                    count
+                }))
+        }
     }
     fn fixture(
         addresses: &[u8],
@@ -130,6 +142,7 @@ mod device {
                 fail_polls: AtomicBool::new(false),
                 failed_polls: AtomicUsize::new(0),
                 opens: AtomicUsize::new(0),
+                firmware_log: Mutex::new(None),
             }),
             written,
             dropped,
@@ -149,6 +162,54 @@ mod device {
                 _ => {}
             }
         }
+    }
+
+    fn firmware_log_event(
+        receiver: &mpsc::Receiver<DeviceEvent>,
+    ) -> Option<(UnitId, Result<Vec<u8>>)> {
+        let deadline = Instant::now() + Duration::from_millis(600);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match receiver.recv_timeout(left) {
+                Ok(DeviceEvent::FirmwareLog { unit, result }) => return Some((unit, result)),
+                Ok(DeviceEvent::Retired(_)) => panic!("the log must never retire a unit"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn firmware_log_is_read_only_when_enabled_and_stock_firmware_is_reported_once() {
+        let (fixture, _, _, _) = fixture(&[1], 0);
+        let (manager, events) =
+            DeviceManager::start_with(Arc::new(Factory(fixture.clone()))).unwrap();
+        let unit = connected(&events);
+        *fixture_lock(&fixture.firmware_log) = Some(b"never read\r\n".to_vec());
+        assert!(
+            firmware_log_event(&events).is_none(),
+            "log read while disabled"
+        );
+
+        *fixture_lock(&fixture.firmware_log) = None;
+        manager.set_firmware_log(true);
+        let (from, result) = firmware_log_event(&events).expect("stock firmware reported");
+        assert_eq!(from, unit);
+        assert!(result.is_err());
+        assert!(
+            firmware_log_event(&events).is_none(),
+            "stock firmware must be reported once, not every poll"
+        );
+
+        *fixture_lock(&fixture.firmware_log) = Some(b"HP Itf: Alt. Setting 1.\r\n".to_vec());
+        let (_, result) = firmware_log_event(&events).expect("log bytes");
+        assert_eq!(result.unwrap(), b"HP Itf: Alt. Setting 1.\r\n");
+        assert!(
+            fixture_lock(&fixture.firmware_log)
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

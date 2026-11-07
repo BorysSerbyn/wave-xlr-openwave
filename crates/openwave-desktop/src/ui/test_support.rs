@@ -169,6 +169,7 @@ impl Backend for FixtureBackend {
             BackendCommand::Setup { .. } => Err(self.forbidden("setup")),
             BackendCommand::Rescan => Err(self.forbidden("rescan")),
             BackendCommand::Activate => Err(self.forbidden("activation")),
+            BackendCommand::FirmwareLog { .. } => Err(self.forbidden("firmware log")),
         }
     }
     fn next_event(&mut self) -> Option<BackendEvent> {

@@ -4,7 +4,10 @@ use crate::{
     actions::{ActionCallbacks, ActionRegistry},
     icons::Icons,
     tray::{Tray, TrayCallbacks},
-    ui::{dialogs, matrix::MatrixView, sidebar::Sidebar, uninstall::UninstallDialog},
+    ui::{
+        dialogs, firmware_log::FirmwareLogWindow, matrix::MatrixView, sidebar::Sidebar,
+        uninstall::UninstallDialog,
+    },
 };
 use adw::prelude::*;
 use openwave_core::model::*;
@@ -163,6 +166,7 @@ struct AppUi {
     calibration: RefCell<Option<CalibrationSnapshot>>,
     calibration_dialog: RefCell<Option<adw::AlertDialog>>,
     calibration_generation: Cell<u64>,
+    firmware_log: RefCell<Option<Rc<FirmwareLogWindow>>>,
 }
 
 impl AppUi {
@@ -235,6 +239,21 @@ impl AppUi {
             let send = submit.clone();
             reconnect.connect_clicked(move |_| send(AppCommand::Reconnect));
             header.pack_end(&reconnect);
+            // Not every icon theme ships a bug; a terminal reads as "log" too.
+            let log_icon = gtk::gdk::Display::default()
+                .filter(|display| gtk::IconTheme::for_display(display).has_icon("bug-symbolic"))
+                .map_or("utilities-terminal-symbolic", |_| "bug-symbolic");
+            let device_log = gtk::Button::builder()
+                .icon_name(log_icon)
+                .tooltip_text("Device log")
+                .build();
+            let target = weak.clone();
+            device_log.connect_clicked(move |_| {
+                if let Some(ui) = target.upgrade() {
+                    ui.show_firmware_log();
+                }
+            });
+            header.pack_end(&device_log);
             let toggle = gtk::ToggleButton::builder()
                 .icon_name("sidebar-show-symbolic")
                 .tooltip_text("Toggle device panel")
@@ -313,6 +332,7 @@ impl AppUi {
                 calibration: RefCell::new(None),
                 calibration_dialog: RefCell::new(None),
                 calibration_generation: Cell::new(0),
+                firmware_log: RefCell::new(None),
             }
         });
         let weak = Rc::downgrade(&ui);
@@ -767,9 +787,23 @@ impl AppUi {
             },
         }
     }
+    fn show_firmware_log(&self) {
+        let window = self
+            .firmware_log
+            .borrow_mut()
+            .get_or_insert_with(|| {
+                FirmwareLogWindow::new(self.window.upcast_ref(), self.submit.clone())
+            })
+            .clone();
+        window.update(&self.latest.borrow().firmware_log);
+        window.present();
+    }
     fn refresh(self: &Rc<Self>, snapshot: Arc<AppSnapshot>) {
         if let Some(registry) = self.registry.borrow().as_ref() {
             registry.refresh(&snapshot);
+        }
+        if let Some(window) = self.firmware_log.borrow().as_ref() {
+            window.update(&snapshot.firmware_log);
         }
         if let Some(tray) = self.tray.borrow().as_ref() {
             tray.update(&snapshot);

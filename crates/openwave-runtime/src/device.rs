@@ -19,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread::{self, JoinHandle},
@@ -46,10 +46,19 @@ pub enum DeviceEvent {
         unit: Option<UnitId>,
         error: OperationError,
     },
+    /// Bytes of the device's own firmware log, or why it has none.
+    FirmwareLog {
+        unit: UnitId,
+        result: Result<Vec<u8>>,
+    },
 }
 
 trait Transport: Send {
     fn read(&mut self, selector: u16, bytes: &mut [u8]) -> Result<usize>;
+    /// Like `read`, but `None` when the device refuses (stalls) the request.
+    fn read_optional(&mut self, selector: u16, bytes: &mut [u8]) -> Result<Option<usize>> {
+        self.read(selector, bytes).map(Some)
+    }
     fn write(&mut self, selector: u16, bytes: &[u8]) -> Result<usize>;
     fn unresponsive(&self) -> bool;
 }
@@ -81,6 +90,29 @@ impl Transport for UsbTransport {
         let count = if dock { dock_read(&mut read) } else { read() }.map_err(|e| self.error(e))?;
         self.timed_out = false;
         Ok(count)
+    }
+    fn read_optional(&mut self, selector: u16, bytes: &mut [u8]) -> Result<Option<usize>> {
+        if self.profile == ProfileId::XlrDockMk2 {
+            return self.read(selector, bytes).map(Some);
+        }
+        match self.handle.read_control(
+            protocol::RT_CLASS_IN,
+            protocol::BREQUEST_READ,
+            selector,
+            self.windex,
+            bytes,
+            protocol::TRANSFER_TIMEOUT,
+        ) {
+            Ok(count) => {
+                self.timed_out = false;
+                Ok(Some(count))
+            }
+            Err(rusb::Error::Pipe) => {
+                self.timed_out = false;
+                Ok(None)
+            }
+            Err(error) => Err(self.error(error)),
+        }
     }
     fn write(&mut self, selector: u16, bytes: &[u8]) -> Result<usize> {
         let count = self
@@ -292,6 +324,21 @@ impl VendorDevice {
         })?;
         let count = self.read_raw(p.wvalue_devinfo, &mut bytes[..p.devinfo_len])?;
         protocol::decode_device_info(self.unit.profile, &bytes[..count])
+    }
+    /// Drain up to `bytes.len()` bytes of the firmware's own log. `None` means
+    /// this unit's firmware offers no log readout (stock firmware stalls).
+    pub fn read_firmware_log(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+        if self.unit.profile != ProfileId::WaveXlr || bytes.is_empty() {
+            return Ok(None);
+        }
+        let length = bytes.len().min(protocol::FIRMWARE_LOG_MAX);
+        let count = self
+            .transport
+            .read_optional(protocol::FIRMWARE_LOG_SELECTOR, &mut bytes[..length])?;
+        if count.is_some_and(|count| count > length) {
+            return Err(OperationError::invalid("USB transfer exceeded buffer"));
+        }
+        Ok(count)
     }
     pub fn read_meters(&mut self) -> Result<MeterLevels> {
         let mut bytes = [0; protocol::MAX_METER_LEN];
@@ -659,6 +706,10 @@ trait UnitBackend: Send {
     fn poll(&mut self) -> Result<(DeviceState, Vec<OperationIssue>)>;
     fn apply(&mut self, settings: &[DeviceSetting]) -> Result<DeviceState>;
     fn unresponsive(&self) -> bool;
+    /// Drain the firmware's own log; `None` when the firmware has no readout.
+    fn firmware_log(&mut self, _bytes: &mut [u8]) -> Result<Option<usize>> {
+        Ok(None)
+    }
 }
 struct SyncedDevice {
     vendor: VendorDevice,
@@ -708,6 +759,9 @@ impl UnitBackend for SyncedDevice {
     }
     fn unresponsive(&self) -> bool {
         self.vendor.transport.unresponsive()
+    }
+    fn firmware_log(&mut self, bytes: &mut [u8]) -> Result<Option<usize>> {
+        self.vendor.read_firmware_log(bytes)
     }
 }
 trait DeviceFactory: Send + Sync {
@@ -800,6 +854,7 @@ pub struct DeviceManager {
     registry: Arc<Mutex<Registry>>,
     sender: mpsc::Sender<ManagerCommand>,
     thread: Option<JoinHandle<Result<()>>>,
+    firmware_log: Arc<AtomicBool>,
 }
 impl DeviceManager {
     pub fn start() -> Result<(Self, mpsc::Receiver<DeviceEvent>)> {
@@ -827,17 +882,24 @@ impl DeviceManager {
         let (sender, receiver) = mpsc::channel();
         let (events, output) = mpsc::channel();
         let shared = registry.clone();
+        let firmware_log = Arc::new(AtomicBool::new(false));
+        let log = firmware_log.clone();
         let thread = thread::Builder::new()
             .name("openwave-usb-discovery".into())
-            .spawn(move || discovery(factory, shared, receiver, events))?;
+            .spawn(move || discovery(factory, shared, receiver, events, log))?;
         Ok((
             Self {
                 registry,
                 sender,
                 thread: Some(thread),
+                firmware_log,
             },
             output,
         ))
+    }
+    /// Read the firmware's own log alongside each poll, on units that offer one.
+    pub fn set_firmware_log(&self, enabled: bool) {
+        self.firmware_log.store(enabled, Ordering::Relaxed);
     }
     pub fn submit(&self, unit: UnitId, job: u64, settings: Vec<DeviceSetting>) -> Result<()> {
         if settings.is_empty() {
@@ -929,11 +991,56 @@ fn snapshot(
         errors,
     }
 }
+/// Drain the firmware log after a poll. Failures here never retire the unit:
+/// the log is diagnostics, and the settings poll decides the unit's health.
+fn drain_firmware_log(
+    device: &mut dyn UnitBackend,
+    unit: UnitId,
+    events: &mpsc::Sender<DeviceEvent>,
+    reported: &mut bool,
+) {
+    let mut bytes = vec![0; protocol::FIRMWARE_LOG_MAX];
+    // A full buffer means more is waiting; a few reads per poll keep up with it.
+    for _ in 0..4 {
+        match device.firmware_log(&mut bytes) {
+            Ok(Some(count)) => {
+                *reported = false;
+                if count > 0 {
+                    let _ = events.send(DeviceEvent::FirmwareLog {
+                        unit,
+                        result: Ok(bytes[..count].to_vec()),
+                    });
+                }
+                if count < bytes.len() {
+                    return;
+                }
+            }
+            result => {
+                if !*reported {
+                    *reported = true;
+                    let error = match result {
+                        Err(error) => error,
+                        _ => OperationError::new(
+                            ErrorCode::Unsupported,
+                            "This device's firmware offers no log readout",
+                        ),
+                    };
+                    let _ = events.send(DeviceEvent::FirmwareLog {
+                        unit,
+                        result: Err(error),
+                    });
+                }
+                return;
+            }
+        }
+    }
+}
 fn unit_worker(
     factory: Arc<dyn DeviceFactory>,
     unit: UnitId,
     queue: Arc<Queue>,
     events: mpsc::Sender<DeviceEvent>,
+    firmware_log: Arc<AtomicBool>,
 ) -> bool {
     let mut unresponsive = false;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
@@ -963,6 +1070,7 @@ fn unit_worker(
             let _ = events.send(DeviceEvent::Connected(snapshot(unit, &info, state, errors)));
             let mut next_poll = Instant::now() + POLL;
             let mut failures = 0;
+            let mut log_reported = false;
             loop {
                 let job = {
                     let mut state = queue.lock_state();
@@ -1015,6 +1123,16 @@ fn unit_worker(
                             failures = 0;
                             let _ = events
                                 .send(DeviceEvent::Observed(snapshot(unit, &info, state, errors)));
+                            if firmware_log.load(Ordering::Relaxed) {
+                                drain_firmware_log(
+                                    device.as_mut(),
+                                    unit,
+                                    &events,
+                                    &mut log_reported,
+                                );
+                            } else {
+                                log_reported = false;
+                            }
                         }
                         Err(error) => {
                             failures += 1;
@@ -1067,6 +1185,7 @@ fn discovery(
     registry: Arc<Mutex<Registry>>,
     commands: mpsc::Receiver<ManagerCommand>,
     events: mpsc::Sender<DeviceEvent>,
+    firmware_log: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut workers: HashMap<UnitId, JoinHandle<bool>> = HashMap::new();
     let mut suppressed = HashSet::new();
@@ -1138,9 +1257,10 @@ fn discovery(
                             };
                             let queue = Arc::new(Queue::default());
                             let (f, q, e) = (factory.clone(), queue.clone(), events.clone());
+                            let log = firmware_log.clone();
                             match thread::Builder::new()
                                 .name(format!("openwave-usb-{bus}-{address}"))
-                                .spawn(move || unit_worker(f, unit, q, e))
+                                .spawn(move || unit_worker(f, unit, q, e, log))
                             {
                                 Ok(worker) => {
                                     shared.units.insert(unit, queue);

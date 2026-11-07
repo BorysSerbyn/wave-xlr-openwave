@@ -1,5 +1,6 @@
 pub(crate) mod components;
 pub mod dialogs;
+pub mod firmware_log;
 pub mod matrix;
 pub mod sidebar;
 pub mod uninstall;

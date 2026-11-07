@@ -15,6 +15,32 @@ pub const MAX_METER_LEN: usize = 10;
 pub const MAX_INFO_LEN: usize = 64;
 pub const DOCK_BLOCKS: [(&str, u16, usize); 3] =
     [("settings", 4, 38), ("headphones", 5, 2), ("monitor", 1, 6)];
+/// Firmware log readout of a Wave XLR (007d) running a firmware patched to
+/// expose its debug log: GET_MEM on the vendor entity with this wValue returns
+/// and removes up to `FIRMWARE_LOG_MAX` bytes of that log, and the first read
+/// switches logging on. Stock firmware stalls the request.
+pub const FIRMWARE_LOG_SELECTOR: u16 = 0x004c;
+pub const FIRMWARE_LOG_MAX: usize = 2048;
+
+/// Split firmware log bytes into complete lines, carrying an unfinished line
+/// over in `partial`. Lines end in CR LF; CR and other control characters are
+/// dropped, bytes are read as Latin-1 so no input can fail to decode.
+pub fn firmware_log_lines(partial: &mut String, bytes: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for &byte in bytes {
+        match byte {
+            b'\n' => lines.push(std::mem::take(partial)),
+            b'\t' => partial.push(' '),
+            byte if byte < 0x20 || byte == 0x7f => {}
+            byte => partial.push(char::from(byte)),
+        }
+    }
+    // A runaway line without a newline must not grow without bound.
+    if partial.len() > 1024 {
+        lines.push(std::mem::take(partial));
+    }
+    lines
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KnobMode {
@@ -548,4 +574,36 @@ pub fn parse_alsa_mute(output: &str) -> Option<bool> {
 
 pub fn parse_alsa_volume(output: &str) -> Option<i32> {
     alsa_value(output)?.parse().ok()
+}
+
+#[cfg(test)]
+mod firmware_log_tests {
+    use super::firmware_log_lines;
+
+    #[test]
+    fn firmware_log_lines_carry_partial_lines_across_reads() {
+        let mut partial = String::new();
+        assert_eq!(
+            firmware_log_lines(&mut partial, b"HP Itf: Alt. Setting 1.\r\nMic It"),
+            ["HP Itf: Alt. Setting 1."]
+        );
+        assert_eq!(partial, "Mic It");
+        assert_eq!(
+            firmware_log_lines(&mut partial, b"f: Alt. Setting 1.\r\n"),
+            ["Mic Itf: Alt. Setting 1."]
+        );
+        assert!(partial.is_empty());
+    }
+
+    #[test]
+    fn firmware_log_lines_never_fail_or_grow_without_bound() {
+        let mut partial = String::new();
+        assert_eq!(
+            firmware_log_lines(&mut partial, b"\xff\x00a\tb\n"),
+            ["\u{ff}a b"]
+        );
+        let lines = firmware_log_lines(&mut partial, &[b'x'; 1500]);
+        assert_eq!(lines.len(), 1);
+        assert!(partial.is_empty());
+    }
 }

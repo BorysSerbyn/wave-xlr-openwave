@@ -229,6 +229,9 @@ impl ActiveWorkers {
                         .map_or_else(|| "USB discovery".into(), |unit| format!("device {unit:?}")),
                     message: error.to_string(),
                 }),
+                DeviceEvent::FirmwareLog { unit, result } => {
+                    BackendEvent::FirmwareLog { unit, result }
+                }
             });
         }
         if let Ok(event) = self.mixer_events.try_recv() {
@@ -333,6 +336,7 @@ pub(super) struct NativeBackend {
     host: Option<HostWorker>,
     queued: VecDeque<BackendEvent>,
     desired: Option<(u64, Arc<DesiredState>, IndexMap<String, CaptureBinding>)>,
+    firmware_log: bool,
     stopping: bool,
     stopped: bool,
 }
@@ -374,6 +378,7 @@ impl NativeBackend {
             host: Some(host),
             queued,
             desired: None,
+            firmware_log: false,
             stopping: false,
             stopped: false,
         };
@@ -405,6 +410,7 @@ impl NativeBackend {
                 return Err(error);
             }
         }
+        active.devices.set_firmware_log(self.firmware_log);
         self.vendor_lease = Some(vendor);
         self.active = Some(active);
         Ok(())
@@ -483,6 +489,12 @@ impl Backend for NativeBackend {
                 .send(HostCommand::Setup { job, mixes })?,
             BackendCommand::Rescan => self.active()?.devices.rescan()?,
             BackendCommand::Activate => self.activate()?,
+            BackendCommand::FirmwareLog { enabled } => {
+                self.firmware_log = enabled;
+                if let Some(active) = self.active.as_mut() {
+                    active.devices.set_firmware_log(enabled);
+                }
+            }
         }
         Ok(())
     }
@@ -822,6 +834,7 @@ mod tests {
                 host: Some(host),
                 queued: VecDeque::new(),
                 desired: None,
+                firmware_log: false,
                 stopping: false,
                 stopped: false,
             };
@@ -1134,6 +1147,7 @@ mod tests {
                 host: None,
                 queued: VecDeque::new(),
                 desired: None,
+                firmware_log: false,
                 stopping: false,
                 stopped: false,
             };
